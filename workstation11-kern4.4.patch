@@ -1,0 +1,350 @@
+diff -rupN orig/vmci-only/linux/driver.c new/vmci-only/linux/driver.c
+--- orig/vmci-only/linux/driver.c	2014-11-20 17:29:15.000000000 -0700
++++ new/vmci-only/linux/driver.c	2016-06-16 13:41:59.000000000 -0700
+@@ -27,6 +27,9 @@
+ #include <linux/file.h>
+ #include <linux/fs.h>
+ #include <linux/init.h>
++#include <linux/vmalloc.h>
++#include <linux/uio.h>
++
+ #if defined(__x86_64__) && LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 12)
+ #   include <linux/ioctl32.h>
+ /* Use weak: not all kernels export sys_ioctl for use by modules */
+@@ -2466,7 +2469,6 @@ vmci_init(void)
+ static void __exit
+ vmci_exit(void)
+ {
+-   int retval;
+ 
+    if (guestDeviceInit) {
+       pci_unregister_driver(&vmci_driver);
+@@ -2479,12 +2481,7 @@ vmci_exit(void)
+ 
+       VMCI_HostCleanup();
+ 
+-      retval = misc_deregister(&linuxState.misc);
+-      if (retval) {
+-         Warning(LGPFX "Module %s: error unregistering\n", VMCI_MODULE_NAME);
+-      } else {
+-         Log(LGPFX"Module %s: unloaded\n", VMCI_MODULE_NAME);
+-      }
++      misc_deregister(&linuxState.misc);
+ 
+       hostDeviceInit = FALSE;
+    }
+diff -rupN orig/vmci-only/linux/vmciKernelIf.c new/vmci-only/linux/vmciKernelIf.c
+--- orig/vmci-only/linux/vmciKernelIf.c	2014-11-20 17:29:15.000000000 -0700
++++ new/vmci-only/linux/vmciKernelIf.c	2016-06-16 14:22:13.000000000 -0700
+@@ -40,6 +40,7 @@
+ #include <linux/socket.h>       /* For memcpy_{to,from}iovec(). */
+ #include <linux/vmalloc.h>
+ #include <linux/wait.h>
++#include <linux/skbuff.h>
+ 
+ #include "compat_highmem.h"
+ #include "compat_interrupt.h"
+@@ -1198,11 +1199,13 @@ __VMCIMemcpyToQueue(VMCIQueue *queue,
+       }
+ 
+       if (isIovec) {
+-         struct iovec *iov = (struct iovec *)src;
++	//struct iovec *iov = (struct iovec *)src;
++	struct msghdr *msg = src;
+          int err;
+ 
+          /* The iovec will track bytesCopied internally. */
+-         err = memcpy_fromiovec((uint8 *)va + pageOffset, iov, toCopy);
++         //err = memcpy_fromiovec((uint8 *)va + pageOffset, iov, toCopy);
++	 err = memcpy_from_msg((uint8 *)va + pageOffset, msg, toCopy);
+          if (err != 0) {
+             if (kernelIf->host) {
+                kunmap(kernelIf->u.h.page[pageIndex]);
+@@ -1273,11 +1276,13 @@ __VMCIMemcpyFromQueue(void *dest,
+       }
+ 
+       if (isIovec) {
+-         struct iovec *iov = (struct iovec *)dest;
++	//struct iovec *iov = (struct iovec *)dest;
++	 struct msghdr *msg = dest;
+          int err;
+ 
+          /* The iovec will track bytesCopied internally. */
+-         err = memcpy_toiovec(iov, (uint8 *)va + pageOffset, toCopy);
++         //err = memcpy_toiovec(iov, (uint8 *)va + pageOffset, toCopy);
++	 err = memcpy_to_msg((uint8 *)va + pageOffset, msg, toCopy);
+          if (err != 0) {
+             if (kernelIf->host) {
+                kunmap(kernelIf->u.h.page[pageIndex]);
+diff -rupN orig/vmmon-only/linux/driver.c new/vmmon-only/linux/driver.c
+--- orig/vmmon-only/linux/driver.c	2014-11-20 18:13:55.000000000 -0700
++++ new/vmmon-only/linux/driver.c	2016-06-16 13:23:34.000000000 -0700
+@@ -400,9 +400,7 @@ cleanup_module(void)
+ #ifdef VMX86_DEVEL
+    unregister_chrdev(linuxState.major, linuxState.deviceName);
+ #else
+-   if (misc_deregister(&linuxState.misc)) {
+-      Warning("Module %s: error unregistering\n", linuxState.deviceName);
+-   }
++   misc_deregister(&linuxState.misc);
+ #endif
+ 
+    Log("Module %s: unloaded\n", linuxState.deviceName);
+diff -rupN orig/vmnet-only/driver.c new/vmnet-only/driver.c
+--- orig/vmnet-only/driver.c	2014-11-20 18:13:56.000000000 -0700
++++ new/vmnet-only/driver.c	2015-08-03 16:28:44.000000000 -0700
+@@ -1191,8 +1191,8 @@ VNetFileOpUnlockedIoctl(struct file    *
+    struct inode *inode = NULL;
+    long err;
+ 
+-   if (filp && filp->f_dentry) {
+-      inode = filp->f_dentry->d_inode;
++   if (filp && filp->f_path.dentry) {
++      inode = filp->f_path.dentry->d_inode;
+    }
+    err = VNetFileOpIoctl(inode, filp, iocmd, ioarg);
+    return err;
+diff -rupN orig/vmnet-only/userif.c new/vmnet-only/userif.c
+--- orig/vmnet-only/userif.c	2014-11-20 18:13:56.000000000 -0700
++++ new/vmnet-only/userif.c	2015-08-03 16:32:14.000000000 -0700
+@@ -523,7 +523,9 @@ VNetCopyDatagram(const struct sk_buff *s
+       .iov_base = buf,
+       .iov_len  = len,
+    };
+-   return skb_copy_datagram_iovec(skb, 0, &iov, len);
++   struct iov_iter to;
++   iov_iter_init(&to, READ, &iov, 1, len);
++   return skb_copy_datagram_iter(skb, 0, &to, len);
+ }
+ 
+ 
+diff -rupN orig/vmnet-only/vmnetInt.h new/vmnet-only/vmnetInt.h
+--- orig/vmnet-only/vmnetInt.h	2014-11-20 18:13:55.000000000 -0700
++++ new/vmnet-only/vmnetInt.h	2016-06-16 13:29:37.000000000 -0700
+@@ -78,8 +78,13 @@
+ 
+ extern struct proto vmnet_proto;
+ #ifdef VMW_NETDEV_HAS_NET
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 2, 00)
+ #   define compat_sk_alloc(_bri, _pri) sk_alloc(&init_net, \
+-                                                PF_NETLINK, _pri, &vmnet_proto)
++						  PF_NETLINK, _pri, &vmnet_proto, 1)
++#else
++#   define compat_sk_alloc(_bri, _pri) sk_alloc(&init_net, \
++						  PF_NETLINK, _pri, &vmnet_proto)
++#endif
+ #else
+ #   define compat_sk_alloc(_bri, _pri) sk_alloc(PF_NETLINK, _pri, &vmnet_proto, 1)
+ #endif
+diff -rupN orig/workstation11-kern4.4.patch new/workstation11-kern4.4.patch
+--- orig/workstation11-kern4.4.patch	2016-06-16 17:23:16.244651289 -0700
++++ new/workstation11-kern4.4.patch	1969-12-31 17:00:00.000000000 -0700
+@@ -1,208 +0,0 @@
+-diff -crB orig/vmci-only/linux/driver.c new/vmci-only/linux/driver.c
+-*** orig/vmci-only/linux/driver.c	2014-11-20 17:29:15.000000000 -0700
+---- new/vmci-only/linux/driver.c	2016-06-16 13:41:59.000000000 -0700
+-***************
+-*** 27,32 ****
+---- 27,35 ----
+-  #include <linux/file.h>
+-  #include <linux/fs.h>
+-  #include <linux/init.h>
+-+ #include <linux/vmalloc.h>
+-+ #include <linux/uio.h>
+-+ 
+-  #if defined(__x86_64__) && LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 12)
+-  #   include <linux/ioctl32.h>
+-  /* Use weak: not all kernels export sys_ioctl for use by modules */
+-***************
+-*** 2466,2472 ****
+-  static void __exit
+-  vmci_exit(void)
+-  {
+--    int retval;
+-  
+-     if (guestDeviceInit) {
+-        pci_unregister_driver(&vmci_driver);
+---- 2469,2474 ----
+-***************
+-*** 2479,2490 ****
+-  
+-        VMCI_HostCleanup();
+-  
+-!       retval = misc_deregister(&linuxState.misc);
+-!       if (retval) {
+-!          Warning(LGPFX "Module %s: error unregistering\n", VMCI_MODULE_NAME);
+-!       } else {
+-!          Log(LGPFX"Module %s: unloaded\n", VMCI_MODULE_NAME);
+-!       }
+-  
+-        hostDeviceInit = FALSE;
+-     }
+---- 2481,2487 ----
+-  
+-        VMCI_HostCleanup();
+-  
+-!       misc_deregister(&linuxState.misc);
+-  
+-        hostDeviceInit = FALSE;
+-     }
+-diff -crB orig/vmci-only/linux/vmciKernelIf.c new/vmci-only/linux/vmciKernelIf.c
+-*** orig/vmci-only/linux/vmciKernelIf.c	2014-11-20 17:29:15.000000000 -0700
+---- new/vmci-only/linux/vmciKernelIf.c	2016-06-16 14:22:13.000000000 -0700
+-***************
+-*** 40,45 ****
+---- 40,46 ----
+-  #include <linux/socket.h>       /* For memcpy_{to,from}iovec(). */
+-  #include <linux/vmalloc.h>
+-  #include <linux/wait.h>
+-+ #include <linux/skbuff.h>
+-  
+-  #include "compat_highmem.h"
+-  #include "compat_interrupt.h"
+-***************
+-*** 1198,1208 ****
+-        }
+-  
+-        if (isIovec) {
+-!          struct iovec *iov = (struct iovec *)src;
+-           int err;
+-  
+-           /* The iovec will track bytesCopied internally. */
+-!          err = memcpy_fromiovec((uint8 *)va + pageOffset, iov, toCopy);
+-           if (err != 0) {
+-              if (kernelIf->host) {
+-                 kunmap(kernelIf->u.h.page[pageIndex]);
+---- 1199,1211 ----
+-        }
+-  
+-        if (isIovec) {
+-! 	//struct iovec *iov = (struct iovec *)src;
+-! 	struct msghdr *msg = src;
+-           int err;
+-  
+-           /* The iovec will track bytesCopied internally. */
+-!          //err = memcpy_fromiovec((uint8 *)va + pageOffset, iov, toCopy);
+-! 	 err = memcpy_from_msg((uint8 *)va + pageOffset, msg, toCopy);
+-           if (err != 0) {
+-              if (kernelIf->host) {
+-                 kunmap(kernelIf->u.h.page[pageIndex]);
+-***************
+-*** 1273,1283 ****
+-        }
+-  
+-        if (isIovec) {
+-!          struct iovec *iov = (struct iovec *)dest;
+-           int err;
+-  
+-           /* The iovec will track bytesCopied internally. */
+-!          err = memcpy_toiovec(iov, (uint8 *)va + pageOffset, toCopy);
+-           if (err != 0) {
+-              if (kernelIf->host) {
+-                 kunmap(kernelIf->u.h.page[pageIndex]);
+---- 1276,1288 ----
+-        }
+-  
+-        if (isIovec) {
+-! 	//struct iovec *iov = (struct iovec *)dest;
+-! 	 struct msghdr *msg = dest;
+-           int err;
+-  
+-           /* The iovec will track bytesCopied internally. */
+-!          //err = memcpy_toiovec(iov, (uint8 *)va + pageOffset, toCopy);
+-! 	 err = memcpy_to_msg((uint8 *)va + pageOffset, msg, toCopy);
+-           if (err != 0) {
+-              if (kernelIf->host) {
+-                 kunmap(kernelIf->u.h.page[pageIndex]);
+-diff -crB orig/vmmon-only/linux/driver.c new/vmmon-only/linux/driver.c
+-*** orig/vmmon-only/linux/driver.c	2014-11-20 18:13:55.000000000 -0700
+---- new/vmmon-only/linux/driver.c	2016-06-16 13:23:34.000000000 -0700
+-***************
+-*** 400,408 ****
+-  #ifdef VMX86_DEVEL
+-     unregister_chrdev(linuxState.major, linuxState.deviceName);
+-  #else
+-!    if (misc_deregister(&linuxState.misc)) {
+-!       Warning("Module %s: error unregistering\n", linuxState.deviceName);
+-!    }
+-  #endif
+-  
+-     Log("Module %s: unloaded\n", linuxState.deviceName);
+---- 400,406 ----
+-  #ifdef VMX86_DEVEL
+-     unregister_chrdev(linuxState.major, linuxState.deviceName);
+-  #else
+-!    misc_deregister(&linuxState.misc);
+-  #endif
+-  
+-     Log("Module %s: unloaded\n", linuxState.deviceName);
+-diff -crB orig/vmnet-only/driver.c new/vmnet-only/driver.c
+-*** orig/vmnet-only/driver.c	2014-11-20 18:13:56.000000000 -0700
+---- new/vmnet-only/driver.c	2015-08-03 16:28:44.000000000 -0700
+-***************
+-*** 1191,1198 ****
+-     struct inode *inode = NULL;
+-     long err;
+-  
+-!    if (filp && filp->f_dentry) {
+-!       inode = filp->f_dentry->d_inode;
+-     }
+-     err = VNetFileOpIoctl(inode, filp, iocmd, ioarg);
+-     return err;
+---- 1191,1198 ----
+-     struct inode *inode = NULL;
+-     long err;
+-  
+-!    if (filp && filp->f_path.dentry) {
+-!       inode = filp->f_path.dentry->d_inode;
+-     }
+-     err = VNetFileOpIoctl(inode, filp, iocmd, ioarg);
+-     return err;
+-diff -crB orig/vmnet-only/userif.c new/vmnet-only/userif.c
+-*** orig/vmnet-only/userif.c	2014-11-20 18:13:56.000000000 -0700
+---- new/vmnet-only/userif.c	2015-08-03 16:32:14.000000000 -0700
+-***************
+-*** 523,529 ****
+-        .iov_base = buf,
+-        .iov_len  = len,
+-     };
+-!    return skb_copy_datagram_iovec(skb, 0, &iov, len);
+-  }
+-  
+-  
+---- 523,531 ----
+-        .iov_base = buf,
+-        .iov_len  = len,
+-     };
+-!    struct iov_iter to;
+-!    iov_iter_init(&to, READ, &iov, 1, len);
+-!    return skb_copy_datagram_iter(skb, 0, &to, len);
+-  }
+-  
+-  
+-diff -crB orig/vmnet-only/vmnetInt.h new/vmnet-only/vmnetInt.h
+-*** orig/vmnet-only/vmnetInt.h	2014-11-20 18:13:55.000000000 -0700
+---- new/vmnet-only/vmnetInt.h	2016-06-16 13:29:37.000000000 -0700
+-***************
+-*** 78,85 ****
+-  
+-  extern struct proto vmnet_proto;
+-  #ifdef VMW_NETDEV_HAS_NET
+-  #   define compat_sk_alloc(_bri, _pri) sk_alloc(&init_net, \
+-!                                                 PF_NETLINK, _pri, &vmnet_proto)
+-  #else
+-  #   define compat_sk_alloc(_bri, _pri) sk_alloc(PF_NETLINK, _pri, &vmnet_proto, 1)
+-  #endif
+---- 78,90 ----
+-  
+-  extern struct proto vmnet_proto;
+-  #ifdef VMW_NETDEV_HAS_NET
+-+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 2, 00)
+-  #   define compat_sk_alloc(_bri, _pri) sk_alloc(&init_net, \
+-! 						  PF_NETLINK, _pri, &vmnet_proto, 1)
+-! #else
+-! #   define compat_sk_alloc(_bri, _pri) sk_alloc(&init_net, \
+-! 						  PF_NETLINK, _pri, &vmnet_proto)
+-! #endif
+-  #else
+-  #   define compat_sk_alloc(_bri, _pri) sk_alloc(PF_NETLINK, _pri, &vmnet_proto, 1)
+-  #endif
+-Only in orig: workstation11-kern4.4.patch
